@@ -3,16 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gespenst</title>
+<title>Gespenst v2</title>
 <style>
-  body{margin:0;background:#000;color:#f80;font-family:sans-serif;text-align:center}
-  video{width:100%;max-height:55vh;background:#111;object-fit:cover}
-  button{font-size:20px;padding:14px 24px;margin:8px;background:#f80;color:#000;border:0;border-radius:8px}
+  body{margin:0;background:#000;color:#f80;font-family:sans-serif;text-align:center;padding-bottom:40px}
+  video{width:100%;max-height:45vh;background:#111;object-fit:cover}
+  button{font-size:18px;padding:12px 18px;margin:6px;background:#f80;color:#000;border:0;border-radius:8px}
   button:disabled{opacity:.4}
-  #status{font-size:18px;padding:6px}
-  #log{font-size:13px;color:#888;padding:6px;min-height:3em}
-  textarea{width:90%;height:90px;background:#111;color:#f80;border:1px solid #f80;font-size:15px}
+  h2{font-size:16px;margin:18px 0 4px;color:#fa0;border-bottom:1px solid #532;padding-bottom:4px}
+  #status{font-size:17px;padding:6px}
+  #log{font-size:13px;color:#888;padding:6px;min-height:2.5em}
+  textarea{width:90%;height:80px;background:#111;color:#f80;border:1px solid #f80;font-size:15px}
   label{display:block;margin:8px;font-size:14px}
+  input[type=range]{width:70%}
+  .mode label{display:inline;margin:0 10px}
 </style>
 </head>
 <body>
@@ -21,7 +24,8 @@
 <div id="status">Bereit. Tippe auf Start, sobald das Handy aufgestellt ist.</div>
 <div id="log"></div>
 
-<label>Sätze (eine Zeile pro Satz)
+<h2>Sprüche</h2>
+<label>Eine Zeile pro Satz
   <textarea id="lines">Hallo... wir haben dich gesehen.
 Bleib stehen, Sterblicher.
 Psst... hinter dir.</textarea>
@@ -32,6 +36,45 @@ Psst... hinter dir.</textarea>
 <label>Pause zwischen Sprüchen (Sekunden)
   <input id="cd" type="number" value="20" min="5" max="300" style="width:70px">
 </label>
+
+<h2>Ausgabe</h2>
+<div class="mode">
+  <label><input type="radio" name="mode" value="speech" checked> Browser-Sprache</label>
+  <label><input type="radio" name="mode" value="file"> Effekt-Datei</label>
+</div>
+
+<h2>Browser-Sprache</h2>
+<label>Tonhöhe: <span id="spPitchV">0.6</span>
+  <input id="spPitch" type="range" min="0.1" max="2" step="0.05" value="0.6">
+</label>
+<label>Tempo: <span id="spRateV">0.85</span>
+  <input id="spRate" type="range" min="0.5" max="1.5" step="0.05" value="0.85">
+</label>
+<div><button id="testSpeech">Test: Satz sprechen</button></div>
+
+<h2>Effekt-Datei</h2>
+<label>Audiodatei laden (MP3, WAV, M4A, OGG)
+  <input id="file" type="file" accept="audio/*">
+</label>
+<label>Tonhöhe (ändert auch das Tempo): <span id="fxPitchV">1</span>
+  <input id="fxPitch" type="range" min="0.5" max="2" step="0.05" value="1">
+</label>
+<label>Verzerrung: <span id="fxDistV">0</span>
+  <input id="fxDist" type="range" min="0" max="1" step="0.05" value="0">
+</label>
+<label>Echo-Anteil: <span id="fxEchoV">0</span>
+  <input id="fxEcho" type="range" min="0" max="1" step="0.05" value="0">
+</label>
+<label>Echo-Abstand (Sekunden): <span id="fxTimeV">0.25</span>
+  <input id="fxTime" type="range" min="0.05" max="0.8" step="0.01" value="0.25">
+</label>
+<label>Echo-Nachklang: <span id="fxFbV">0.4</span>
+  <input id="fxFb" type="range" min="0" max="0.85" step="0.05" value="0.4">
+</label>
+<div>
+  <button id="playFx" disabled>Test: Effekt abspielen</button>
+  <button id="stopFx">Stopp</button>
+</div>
 
 <script type="module">
 import { FilesetResolver, ObjectDetector } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
@@ -45,34 +88,176 @@ const linesEl = $("lines"), thrEl = $("thr"), thrVal = $("thrv"), cdEl = $("cd")
 
 let detector = null, stream = null, wakeLock = null, running = false;
 let lastDetect = 0, hits = 0, lastSpeak = 0;
-const DETECT_INTERVAL_MS = 400; // A40: Erkennung nicht öfter als ~2,5x pro Sekunde
-const REQUIRED_HITS = 2;        // zwei aufeinanderfolgende Treffer, weniger Fehlalarme
+const DETECT_INTERVAL_MS = 400;
+const REQUIRED_HITS = 2;
 
-function logLine(t) {
-  logEl.textContent = new Date().toLocaleTimeString("de-DE") + " " + t;
+// ---------- Audio ----------
+let audioCtx = null;
+let fxBuffer = null;
+let activeFx = null; // { src, dryG, distG, wetG, fb, delay }
+
+function ensureCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
 }
+
+function distortionCurve(amount) {
+  const k = amount * 100;
+  const n = 44100, curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i * 2) / n - 1;
+    curve[i] = ((3 + k) * x * 20 * Math.PI / 180) / (Math.PI + k * Math.abs(x));
+  }
+  return curve;
+}
+
+function fxParams() {
+  return {
+    rate: parseFloat($("fxPitch").value),
+    dist: parseFloat($("fxDist").value),
+    echo: parseFloat($("fxEcho").value),
+    time: parseFloat($("fxTime").value),
+    fb:   parseFloat($("fxFb").value)
+  };
+}
+
+function applyLive() {
+  if (!activeFx) return;
+  const p = fxParams();
+  activeFx.src.playbackRate.value = p.rate;
+  activeFx.distG.gain.value = p.dist;
+  activeFx.dryG.gain.value = 1 - p.dist * 0.5;
+  activeFx.wetG.gain.value = p.echo;
+  activeFx.delay.delayTime.value = p.time;
+  activeFx.fb.gain.value = p.fb;
+  activeFx.shaper.curve = distortionCurve(p.dist);
+}
+
+function playFx() {
+  if (!fxBuffer) { logLine("Keine Audiodatei geladen"); return; }
+  stopFx();
+  const ctx = ensureCtx();
+  const p = fxParams();
+
+  const src = ctx.createBufferSource();
+  src.buffer = fxBuffer;
+  src.playbackRate.value = p.rate;
+
+  const dryG = ctx.createGain();
+  const shaper = ctx.createWaveShaper();
+  shaper.curve = distortionCurve(p.dist);
+  shaper.oversample = "4x";
+  const distG = ctx.createGain();
+  distG.gain.value = p.dist;
+  dryG.gain.value = 1 - p.dist * 0.5;
+
+  const delay = ctx.createDelay(1.0);
+  delay.delayTime.value = p.time;
+  const fb = ctx.createGain();
+  fb.gain.value = p.fb;
+  const wetG = ctx.createGain();
+  wetG.gain.value = p.echo;
+
+  const master = ctx.createGain();
+  master.gain.value = 0.9;
+
+  src.connect(dryG).connect(master);
+  src.connect(shaper).connect(distG).connect(master);
+  src.connect(delay);
+  delay.connect(wetG).connect(master);
+  delay.connect(fb).connect(delay);
+  master.connect(ctx.destination);
+
+  src.onended = () => { if (activeFx && activeFx.src === src) activeFx = null; };
+  src.start();
+  activeFx = { src, dryG, distG, wetG, fb, delay, shaper };
+  return src;
+}
+
+function stopFx() {
+  if (activeFx) {
+    try { activeFx.src.stop(); } catch (e) {}
+    activeFx = null;
+  }
+}
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const ctx = ensureCtx();
+    fxBuffer = await ctx.decodeAudioData(await f.arrayBuffer());
+    $("playFx").disabled = false;
+    logLine("Datei geladen: " + f.name);
+  } catch (err) {
+    logLine("Datei konnte nicht gelesen werden: " + err.message);
+  }
+});
+
+["fxPitch", "fxDist", "fxEcho", "fxTime", "fxFb"].forEach(id => {
+  $(id).addEventListener("input", () => {
+    const v = $(id).value;
+    const label = { fxPitch: "fxPitchV", fxDist: "fxDistV", fxEcho: "fxEchoV", fxTime: "fxTimeV", fxFb: "fxFbV" }[id];
+    $(label).textContent = v;
+    applyLive();
+  });
+});
+
+$("playFx").addEventListener("click", () => playFx());
+$("stopFx").addEventListener("click", () => stopFx());
+
+// ---------- Browser-Sprache ----------
+["spPitch", "spRate"].forEach(id => {
+  $(id).addEventListener("input", () => {
+    $(id === "spPitch" ? "spPitchV" : "spRateV").textContent = $(id).value;
+  });
+});
 
 function pickVoice() {
   const voices = speechSynthesis.getVoices();
   return voices.find(v => v.lang && v.lang.startsWith("de")) || null;
 }
 
-function speakRandom() {
-  const lines = linesEl.value.split("\n").map(s => s.trim()).filter(Boolean);
-  if (!lines.length) return;
-  const text = lines[Math.floor(Math.random() * lines.length)];
+function speakSpeech(text) {
   const u = new SpeechSynthesisUtterance(text);
   u.lang = "de-DE";
   const voice = pickVoice();
   if (voice) u.voice = voice;
-  u.pitch = 0.6;
-  u.rate = 0.85;
+  u.pitch = parseFloat($("spPitch").value);
+  u.rate = parseFloat($("spRate").value);
   speechSynthesis.cancel();
   speechSynthesis.speak(u);
 }
 
+$("testSpeech").addEventListener("click", () => {
+  speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+  speakSpeech("Hallo... wir haben dich gesehen.");
+});
+
+// ---------- Ausgabe wählen ----------
+function outputMode() {
+  return document.querySelector("input[name=mode]:checked").value;
+}
+
+function speakRandom() {
+  const lines = linesEl.value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!lines.length) return;
+  const text = lines[Math.floor(Math.random() * lines.length)];
+  if (outputMode() === "file" && fxBuffer) {
+    playFx();
+  } else {
+    speakSpeech(text);
+  }
+}
+
+// ---------- Erkennung ----------
+function logLine(t) {
+  logEl.textContent = new Date().toLocaleTimeString("de-DE") + " " + t;
+}
+
 async function requestWakeLock() {
-  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* optional */ }
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -88,7 +273,7 @@ async function loadDetector() {
   statusEl.textContent = "Lade Modell (kann einen Moment dauern)…";
   const vision = await FilesetResolver.forVisionTasks(WASM_URL);
   detector = await ObjectDetector.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" }, // CPU ist auf dem A40 stabiler als GPU
+    baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
     runningMode: "VIDEO",
     scoreThreshold: parseFloat(thrEl.value),
     maxResults: 5,
@@ -115,15 +300,16 @@ function loop() {
     lastSpeak = now;
     hits = 0;
     speakRandom();
-    logLine("Person erkannt, Spruch abgespielt");
+    logLine("Person erkannt, Ausgabe läuft");
   }
 }
 
 startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
 
-  // Chrome erlaubt Sprachausgabe erst nach einer Nutzeraktion; dieser leere Spruch schaltet sie frei.
+  // Schaltet Sprach- und Audio-Ausgabe frei (Nutzeraktion nötig).
   speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+  ensureCtx();
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
