@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gespenst</title>
+<style>
+  body{margin:0;background:#000;color:#f80;font-family:sans-serif;text-align:center}
+  video{width:100%;max-height:55vh;background:#111;object-fit:cover}
+  button{font-size:20px;padding:14px 24px;margin:8px;background:#f80;color:#000;border:0;border-radius:8px}
+  button:disabled{opacity:.4}
+  #status{font-size:18px;padding:6px}
+  #log{font-size:13px;color:#888;padding:6px;min-height:3em}
+  textarea{width:90%;height:90px;background:#111;color:#f80;border:1px solid #f80;font-size:15px}
+  label{display:block;margin:8px;font-size:14px}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<div><button id="start">Start</button></div>
+<div id="status">Bereit. Tippe auf Start, sobald das Handy aufgestellt ist.</div>
+<div id="log"></div>
+
+<label>Sätze (eine Zeile pro Satz)
+  <textarea id="lines">Hallo... wir haben dich gesehen.
+Bleib stehen, Sterblicher.
+Psst... hinter dir.</textarea>
+</label>
+<label>Erkennungsschwelle: <span id="thrv">0.5</span>
+  <input id="thr" type="range" min="0.2" max="0.9" step="0.05" value="0.5">
+</label>
+<label>Pause zwischen Sprüchen (Sekunden)
+  <input id="cd" type="number" value="20" min="5" max="300" style="width:70px">
+</label>
+
+<script type="module">
+import { FilesetResolver, ObjectDetector } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const WASM_URL  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+
+const $ = id => document.getElementById(id);
+const video = $("v"), startBtn = $("start"), statusEl = $("status"), logEl = $("log");
+const linesEl = $("lines"), thrEl = $("thr"), thrVal = $("thrv"), cdEl = $("cd");
+
+let detector = null, stream = null, wakeLock = null, running = false;
+let lastDetect = 0, hits = 0, lastSpeak = 0;
+const DETECT_INTERVAL_MS = 400; // A40: Erkennung nicht öfter als ~2,5x pro Sekunde
+const REQUIRED_HITS = 2;        // zwei aufeinanderfolgende Treffer, weniger Fehlalarme
+
+function logLine(t) {
+  logEl.textContent = new Date().toLocaleTimeString("de-DE") + " " + t;
+}
+
+function pickVoice() {
+  const voices = speechSynthesis.getVoices();
+  return voices.find(v => v.lang && v.lang.startsWith("de")) || null;
+}
+
+function speakRandom() {
+  const lines = linesEl.value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!lines.length) return;
+  const text = lines[Math.floor(Math.random() * lines.length)];
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "de-DE";
+  const voice = pickVoice();
+  if (voice) u.voice = voice;
+  u.pitch = 0.6;
+  u.rate = 0.85;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(u);
+}
+
+async function requestWakeLock() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* optional */ }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && running) requestWakeLock();
+});
+
+thrEl.addEventListener("input", () => {
+  thrVal.textContent = thrEl.value;
+  if (detector) detector.setOptions({ scoreThreshold: parseFloat(thrEl.value) });
+});
+
+async function loadDetector() {
+  statusEl.textContent = "Lade Modell (kann einen Moment dauern)…";
+  const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+  detector = await ObjectDetector.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" }, // CPU ist auf dem A40 stabiler als GPU
+    runningMode: "VIDEO",
+    scoreThreshold: parseFloat(thrEl.value),
+    maxResults: 5,
+    categoryAllowlist: ["person"]
+  });
+}
+
+function loop() {
+  if (!running) return;
+  requestAnimationFrame(loop);
+
+  const now = performance.now();
+  if (video.readyState < 2 || now - lastDetect < DETECT_INTERVAL_MS) return;
+  lastDetect = now;
+
+  const res = detector.detectForVideo(video, now);
+  const count = res.detections.length;
+
+  hits = count > 0 ? hits + 1 : 0;
+  statusEl.textContent = count > 0 ? `Person im Bild (${count})` : "Niemand im Bild";
+
+  const cooldownMs = Math.max(5, parseInt(cdEl.value, 10) || 20) * 1000;
+  if (hits >= REQUIRED_HITS && now - lastSpeak > cooldownMs) {
+    lastSpeak = now;
+    hits = 0;
+    speakRandom();
+    logLine("Person erkannt, Spruch abgespielt");
+  }
+}
+
+startBtn.addEventListener("click", async () => {
+  startBtn.disabled = true;
+
+  // Chrome erlaubt Sprachausgabe erst nach einer Nutzeraktion; dieser leere Spruch schaltet sie frei.
+  speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: 640, height: 480 },
+      audio: false
+    });
+  } catch (e) {
+    statusEl.textContent = "Kamera nicht verfügbar: " + e.name + ". Prüfe die Kamera-Berechtigung für diese Seite.";
+    startBtn.disabled = false;
+    return;
+  }
+
+  video.srcObject = stream;
+  await video.play();
+  await requestWakeLock();
+
+  try {
+    await loadDetector();
+  } catch (e) {
+    statusEl.textContent = "Modell konnte nicht geladen werden: " + e.message + ". Internetverbindung prüfen.";
+    startBtn.disabled = false;
+    return;
+  }
+
+  running = true;
+  statusEl.textContent = "Läuft. Viel Spaß.";
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
